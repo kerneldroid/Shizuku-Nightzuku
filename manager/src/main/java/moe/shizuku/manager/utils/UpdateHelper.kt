@@ -1,20 +1,22 @@
 package moe.shizuku.manager.utils
 
-import android.content.Context
+import android.text.TextUtils
 import android.widget.Toast
+import java.io.File
+import java.io.IOException
+import java.security.MessageDigest
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 import moe.shizuku.manager.R
 import moe.shizuku.manager.ShizukuApplication
 import moe.shizuku.manager.ShizukuSettings
 import moe.shizuku.manager.utils.ApkUtils.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.File
-import java.security.MessageDigest
 
 object UpdateHelper {
     private val app = ShizukuApplication.application
@@ -40,7 +42,7 @@ object UpdateHelper {
             )
 
         override fun toString(): String =
-            if (commit == 0)  "$major.$minor.$patch" else "$major.$minor.$patch.r$commit"
+            if (commit == 0) "$major.$minor.$patch" else "$major.$minor.$patch.r$commit"
 
         companion object {
             fun parse(tag: String): Version? {
@@ -61,7 +63,7 @@ object UpdateHelper {
         val version: Version,
         val filename: String,
         val url: String,
-        val digest: String
+        val digest: String?
     )
 
     @Serializable
@@ -75,21 +77,23 @@ object UpdateHelper {
     data class GitHubAsset(
         val name: String,
         val browser_download_url: String,
-        val digest: String
+        val digest: String? = null
     )
 
-    private lateinit var latestRelease: Release
+    @Volatile
+    private var latestRelease: Release? = null
+
+    private suspend fun showToast(resId: Int) {
+        withContext(Dispatchers.Main) {
+            Toast.makeText(appContext, appContext.getString(resId), Toast.LENGTH_SHORT).show()
+        }
+    }
 
     suspend fun checkAndInstallUpdates() {
         if (isUpdateAvailable()) {
             update()
         } else {
-            Toast
-                .makeText(
-                    appContext,
-                    appContext.getString(R.string.update_latest_installed),
-                    Toast.LENGTH_SHORT,
-                ).show()
+            showToast(R.string.update_latest_installed)
         }
     }
 
@@ -100,67 +104,61 @@ object UpdateHelper {
             Version.parse(ShizukuSettings.getLastPromptedVersion())
                 ?: Version.parse(getVersionName())
                 ?: return false
-        return if (isUpdateAvailable()) latestRelease.version > lastPromptedVersion else false
+        if (!isUpdateAvailable()) return false
+        val rel = latestRelease ?: return false
+        return rel.version > lastPromptedVersion
     }
 
     suspend fun isUpdateAvailable(): Boolean {
-        try {
-            val latest = fetchLatestRelease().version ?: return false
+        return try {
+            val latest = fetchLatestRelease().version
             val current = Version.parse(getVersionName()) ?: return false
-            return latest > current
+            latest > current
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            Toast
-                .makeText(
-                    appContext,
-                    appContext.getString(R.string.update_check_failed),
-                    Toast.LENGTH_SHORT,
-                ).show()
-            return false
+            showToast(R.string.update_check_failed)
+            false
         }
     }
 
-    fun updateLastPromptedVersion() = ShizukuSettings.setLastPromptedVersion(latestRelease.version.toString())
+    fun updateLastPromptedVersion() {
+        val rel = latestRelease ?: return
+        ShizukuSettings.setLastPromptedVersion(rel.version.toString())
+    }
 
     suspend fun update() {
-        if (!::latestRelease.isInitialized && !isUpdateAvailable()) return
+        val rel = latestRelease ?: run {
+            if (!isUpdateAvailable()) return
+            latestRelease ?: return
+        }
 
-        Toast
-            .makeText(
-                appContext,
-                appContext.getString(R.string.update_downloading),
-                Toast.LENGTH_SHORT,
-            ).show()
+        showToast(R.string.update_downloading)
 
-        val apk =
-            latestRelease.download()?.run {
-                val pm = appContext.packageManager
-                val apkPackageName = pm.getPackageArchiveInfo(
-                    this.path, 0
-                )?.packageName
-                if (app.packageName != apkPackageName) {
-                    try {
-                        android.util.Log.d("UpdateHelper", "Changing package name from $apkPackageName to ${app.packageName}")
-                        changePackageName(app.packageName)
-                    } catch (e: Exception) {
-                        Toast
-                            .makeText(
-                                appContext,
-                                appContext.getString(R.string.update_failed),
-                                Toast.LENGTH_SHORT,
-                            ).show()
-                        return@update
-                    }
-                } else {
-                    this
+        val downloadedFile = try {
+            rel.download()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            showToast(R.string.update_download_failed)
+            return
+        }
+
+        val apk = try {
+            val pm = appContext.packageManager
+            val apkPackageName = pm.getPackageArchiveInfo(downloadedFile.path, 0)?.packageName
+            if (!TextUtils.isEmpty(apkPackageName) && app.packageName != apkPackageName) {
+                android.util.Log.d("UpdateHelper", "Changing package name from $apkPackageName to ${app.packageName}")
+                withContext(Dispatchers.IO) {
+                    downloadedFile.changePackageName(app.packageName)
                 }
+            } else {
+                downloadedFile
             }
-        if (apk == null) {
-            Toast
-                .makeText(
-                    appContext,
-                    appContext.getString(R.string.update_download_failed),
-                    Toast.LENGTH_SHORT,
-                ).show()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            showToast(R.string.update_failed)
             return
         }
 
@@ -174,10 +172,14 @@ object UpdateHelper {
 
     private suspend fun fetchLatestRelease(): Release =
         withContext(Dispatchers.IO) {
-            val url = "https://api.github.com/repos/thedjchi/Shizuku/releases"
+            val url = "https://api.github.com/repos/kerneldroid/Shizuku-Nightzuku/releases"
             val request = Request.Builder().url(url).build()
-            val response = client.newCall(request).execute()
-            val body = response.body?.string() ?: throw Exception("Couldn't fetch releases")
+            val body = client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw IOException("Unexpected HTTP code ${response.code}")
+                }
+                response.body?.string() ?: throw IOException("Couldn't fetch releases")
+            }
 
             val releases = json.decodeFromString<List<GitHubRelease>>(body)
             val filtered =
@@ -204,22 +206,34 @@ object UpdateHelper {
                     )
                 }.maxByOrNull { it.version }
                 ?.also { latestRelease = it }
-                ?: throw Exception("No valid releases found")
+                ?: throw IOException("No valid releases found")
         }
 
     private suspend fun Release.download(): File =
         withContext(Dispatchers.IO) {
             val request = Request.Builder().url(url).build()
-            val response = client.newCall(request).execute()
+            val safeName = File(filename).name.ifEmpty { "update.apk" }
+            val apkFile = File(appContext.cacheDir, safeName)
 
-            val apkFile = File(appContext.cacheDir, filename)
-            apkFile.outputStream().use { out ->
-                response.body?.byteStream()?.copyTo(out)
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw IOException("Download failed with HTTP ${response.code}")
+                }
+                val body = response.body ?: throw IOException("Empty response body")
+                apkFile.outputStream().use { out ->
+                    body.byteStream().use { input ->
+                        input.copyTo(out)
+                    }
+                }
             }
 
-            val downloadedDigest = "sha256:" + apkFile.sha256()
-            if (downloadedDigest != digest)
-                throw SecurityException("Digest of downloaded file does not match the one reported by GitHub")
+            if (!digest.isNullOrBlank()) {
+                val downloadedDigest = "sha256:" + apkFile.sha256()
+                if (!downloadedDigest.equals(digest, ignoreCase = true)) {
+                    apkFile.delete()
+                    throw SecurityException("Digest of downloaded file does not match the one reported by GitHub")
+                }
+            }
 
             apkFile
         }

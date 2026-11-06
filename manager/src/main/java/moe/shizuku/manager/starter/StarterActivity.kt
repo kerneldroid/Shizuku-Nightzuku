@@ -16,7 +16,6 @@ import java.net.SocketTimeoutException
 import javax.net.ssl.SSLProtocolException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -25,14 +24,15 @@ import kotlinx.coroutines.withContext
 import moe.shizuku.manager.AppConstants.EXTRA
 import moe.shizuku.manager.R
 import moe.shizuku.manager.adb.AdbKeyException
+import moe.shizuku.manager.adb.AdbPairingRequiredException
 import moe.shizuku.manager.adb.AdbStarter
 import moe.shizuku.manager.app.AppBarActivity
-import moe.shizuku.manager.utils.ShizukuStateMachine
 import moe.shizuku.manager.databinding.StarterActivityBinding
+import moe.shizuku.manager.utils.ShizukuStateMachine
 import rikka.lifecycle.Resource
 import rikka.lifecycle.Status
 
-private class NotRootedException: Exception()
+private class NotRootedException : Exception()
 
 class StarterActivity : AppBarActivity() {
 
@@ -67,7 +67,7 @@ class StarterActivity : AppBarActivity() {
                     is ConnectException -> {
                         message = R.string.cannot_connect_port
                     }
-                    is SSLProtocolException -> {
+                    is AdbPairingRequiredException, is SSLProtocolException -> {
                         message = R.string.adb_pair_required
                     }
                 }
@@ -143,7 +143,6 @@ class ViewModel(application: Application) : AndroidViewModel(application) {
 
         return withContext(Dispatchers.IO) {
             if (!Shell.getShell().isRoot) {
-                // Try again just in case
                 Shell.getCachedShell()?.close()
 
                 if (!Shell.getShell().isRoot) {
@@ -168,5 +167,5 @@ class ViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
-    
+
 }

@@ -5,32 +5,27 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
-import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.database.ContentObserver
-import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
-import androidx.lifecycle.asFlow
 import androidx.work.*
 import java.io.EOFException
 import java.util.concurrent.TimeoutException
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import moe.shizuku.manager.R
 import moe.shizuku.manager.ShizukuSettings
 import moe.shizuku.manager.adb.AdbMdns
+import moe.shizuku.manager.adb.AdbSettings
 import moe.shizuku.manager.adb.AdbStarter
 import moe.shizuku.manager.receiver.ShizukuReceiverStarter
 import moe.shizuku.manager.receiver.ShizukuReceiverStarter.WorkerState
@@ -49,9 +44,7 @@ class AdbStartWorker(context: Context, params: WorkerParameters) : CoroutineWork
             )
 
             val cr = applicationContext.contentResolver
-
-            Settings.Global.putInt(cr, Settings.Global.ADB_ENABLED, 1)
-            Settings.Global.putLong(cr, "adb_allowed_connection_time", 0L)
+            AdbSettings.enableAdbBaseSettings(applicationContext)
 
             val tcpPort = EnvironmentUtils.getAdbTcpPort()
             if (tcpPort > 0 && !ShizukuSettings.getTcpMode()) {
@@ -93,9 +86,9 @@ class AdbStartWorker(context: Context, params: WorkerParameters) : CoroutineWork
                         unlockReceiver = object : BroadcastReceiver() {
                             override fun onReceive(context: Context, intent: Intent) {
                                 if (intent.action == Intent.ACTION_USER_PRESENT) {
-                                    context.unregisterReceiver(this)
+                                    runCatching { context.unregisterReceiver(this) }
                                     unlockReceiver = null
-                                    Settings.Global.putInt(cr, "adb_wifi_enabled", 1)
+                                    AdbSettings.enableWirelessAdb(context)
                                 }
                             }
                         }
@@ -107,7 +100,7 @@ class AdbStartWorker(context: Context, params: WorkerParameters) : CoroutineWork
 
                 val observer = object : ContentObserver(null) {
                     override fun onChange(selfChange: Boolean) {
-                        when (Settings.Global.getInt(cr, "adb_wifi_enabled", 0)) {
+                        when (runCatching { Settings.Global.getInt(cr, AdbSettings.KEY_WIFI_ADB, 0) }.getOrDefault(0)) {
                             0 -> if (awaitingAuth) {
                                 close(SecurityException("Network is not authorized for wireless debugging"))
                             } else handleAuth()
@@ -116,18 +109,18 @@ class AdbStartWorker(context: Context, params: WorkerParameters) : CoroutineWork
                     }
                 }
 
-                Settings.Global.putInt(cr, "adb_wifi_enabled", 1)
-                cr.registerContentObserver(Settings.Global.getUriFor("adb_wifi_enabled"), false, observer)
+                AdbSettings.enableWirelessAdb(applicationContext)
+                cr.registerContentObserver(Settings.Global.getUriFor(AdbSettings.KEY_WIFI_ADB), false, observer)
                 startDiscoveryWithTimeout()
 
                 awaitClose {
                     adbMdns.stop()
                     timeoutJob?.cancel()
-                    cr.unregisterContentObserver(observer)
-                    unlockReceiver?.let { applicationContext.unregisterReceiver(it) }
+                    runCatching { cr.unregisterContentObserver(observer) }
+                    unlockReceiver?.let { runCatching { applicationContext.unregisterReceiver(it) } }
                 }
             }.first()
-            
+
             AdbStarter.startAdb(applicationContext, port)
             Starter.waitForBinder()
 

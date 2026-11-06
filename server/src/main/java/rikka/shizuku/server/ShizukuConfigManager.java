@@ -5,6 +5,8 @@ import static rikka.shizuku.server.ServerConstants.PERMISSION;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Process;
+import android.system.Os;
 import android.util.AtomicFile;
 
 import androidx.annotation.Nullable;
@@ -18,6 +20,7 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -25,10 +28,10 @@ import java.util.Set;
 
 import kotlin.collections.ArraysKt;
 import rikka.hidden.compat.PackageManagerApis;
+import rikka.shizuku.server.ktx.HandlerKt;
 import rikka.shizuku.server.util.Android17Compat;
 import rikka.shizuku.server.util.InstalledPackagesCompat;
-import rikka.hidden.compat.UserManagerApis;
-import rikka.shizuku.server.ktx.HandlerKt;
+import rikka.shizuku.server.util.UsersCompat;
 
 public class ShizukuConfigManager extends ConfigManager {
 
@@ -38,7 +41,9 @@ public class ShizukuConfigManager extends ConfigManager {
             .setVersion(ShizukuConfig.LATEST_VERSION)
             .create();
 
-    private static final long WRITE_DELAY = 10 * 1000;
+    private static final long WRITE_DELAY = 1000L;
+    private static final int SHELL_UID = 2000;
+    private static final int MODE_0600 = 0x180;
 
     private static final File FILE = new File("/data/user_de/0/com.android.shell/shizuku.json");
     private static final AtomicFile ATOMIC_FILE = new AtomicFile(FILE);
@@ -54,7 +59,7 @@ public class ShizukuConfigManager extends ConfigManager {
 
         ShizukuConfig config = null;
         try {
-            config = GSON_IN.fromJson(new InputStreamReader(stream), ShizukuConfig.class);
+            config = GSON_IN.fromJson(new InputStreamReader(stream, StandardCharsets.UTF_8), ShizukuConfig.class);
         } catch (Throwable tr) {
             LOGGER.w(tr, "load config");
         } finally {
@@ -80,7 +85,20 @@ public class ShizukuConfigManager extends ConfigManager {
 
             try {
                 String json = GSON_OUT.toJson(config);
-                stream.write(json.getBytes());
+                stream.write(json.getBytes(StandardCharsets.UTF_8));
+
+                // Ensure shell (uid 2000) always owns the replacement inode even when the
+                // server was previously started as root (uid 0).
+                if (Process.myUid() == 0) {
+                    try {
+                        Os.fchown(stream.getFD(), SHELL_UID, SHELL_UID);
+                    } catch (Throwable ignored) {
+                    }
+                }
+                try {
+                    Os.fchmod(stream.getFD(), MODE_0600);
+                } catch (Throwable ignored) {
+                }
 
                 ATOMIC_FILE.finishWrite(stream);
                 LOGGER.v("config saved");
@@ -140,6 +158,7 @@ public class ShizukuConfigManager extends ConfigManager {
             final int shrunkSize = entry.packages.size();
             if (shrunkSize < rawSize) {
                 LOGGER.w("entry.packages has duplicate! Shrunk. (%d -> %d)", rawSize, shrunkSize);
+                changed = true;
             }
 
             if (packagesChanged) {
@@ -149,7 +168,7 @@ public class ShizukuConfigManager extends ConfigManager {
             }
         }
 
-        for (int userId : UserManagerApis.getUserIdsNoThrow()) {
+        for (int userId : UsersCompat.getUserIdsNoThrow()) {
             for (PackageInfo pi : InstalledPackagesCompat.getInstalledPackagesNoThrow(PackageManager.GET_PERMISSIONS, userId)) {
                 if (pi == null
                         || pi.applicationInfo == null
@@ -159,19 +178,26 @@ public class ShizukuConfigManager extends ConfigManager {
                 }
 
                 int uid = pi.applicationInfo.uid;
+                if (findLocked(uid) != null) {
+                    continue;
+                }
+
                 boolean allowed;
                 try {
-                    allowed = Android17Compat.checkPermission(PERMISSION, uid) == PackageManager.PERMISSION_GRANTED;
+                    allowed = Android17Compat.checkPermission(PERMISSION, pi.packageName, userId) == PackageManager.PERMISSION_GRANTED
+                            || Android17Compat.checkPermission(PERMISSION, uid) == PackageManager.PERMISSION_GRANTED;
                 } catch (Throwable e) {
                     LOGGER.w("checkPermission");
                     continue;
                 }
 
-                List<String> packages = new ArrayList<>();
-                packages.add(pi.packageName);
+                if (allowed) {
+                    List<String> packages = new ArrayList<>();
+                    packages.add(pi.packageName);
 
-                updateLocked(uid, packages, ConfigManager.MASK_PERMISSION, allowed ? ConfigManager.FLAG_ALLOWED : 0);
-                changed = true;
+                    updateLocked(uid, packages, ConfigManager.MASK_PERMISSION, ConfigManager.FLAG_ALLOWED);
+                    changed = true;
+                }
             }
         }
 
@@ -189,6 +215,11 @@ public class ShizukuConfigManager extends ConfigManager {
             HandlerKt.getWorkerHandler().removeCallbacks(mWriteRunner);
         }
         HandlerKt.getWorkerHandler().postDelayed(mWriteRunner, WRITE_DELAY);
+    }
+
+    private void persistNowLocked() {
+        HandlerKt.getWorkerHandler().removeCallbacks(mWriteRunner);
+        HandlerKt.getWorkerHandler().post(mWriteRunner);
     }
 
     private ShizukuConfig.PackageEntry findLocked(int uid) {
@@ -227,7 +258,7 @@ public class ShizukuConfigManager extends ConfigManager {
                 entry.packages.add(packageName);
             }
         }
-        scheduleWriteLocked();
+        persistNowLocked();
     }
 
     public void update(int uid, List<String> packages, int mask, int values) {
@@ -242,12 +273,24 @@ public class ShizukuConfigManager extends ConfigManager {
             return;
         }
         config.packages.remove(entry);
-        scheduleWriteLocked();
+        persistNowLocked();
     }
 
     public void remove(int uid) {
         synchronized (this) {
             removeLocked(uid);
         }
+    }
+
+    public synchronized boolean getNightDogEnabled() {
+        return config.nightDogEnabled;
+    }
+
+    public synchronized void setNightDogEnabled(boolean enabled) {
+        if (config.nightDogEnabled == enabled) {
+            return;
+        }
+        config.nightDogEnabled = enabled;
+        persistNowLocked();
     }
 }

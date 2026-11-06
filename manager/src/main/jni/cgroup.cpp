@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstdio>
+#include "cgroup.h"
 
 namespace cgroup {
     bool switch_cgroup(const char *cgroup, int pid) {
@@ -13,8 +14,9 @@ namespace cgroup {
         if (fd == -1)
             return false;
         snprintf(buf, sizeof(buf), "%d\n", pid);
-        ssize_t c = write(fd, buf, strlen(buf));
+        size_t len = strlen(buf);
+        ssize_t c = write(fd, buf, len);
         close(fd);
-        return c == strlen(buf);
+        return c == static_cast<ssize_t>(len);
     }
 }

@@ -1,18 +1,22 @@
 #include <sys/types.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
-#include <zconf.h>
+#include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
+#include <climits>
 #include <sched.h>
 #include <cctype>
 #include <cerrno>
 #include "misc.h"
 
 ssize_t fdgets(char *buf, const size_t size, int fd) {
+    if (buf == nullptr || size == 0)
+        return -1;
     buf[0] = '\0';
     ssize_t ret;
     do {
@@ -28,19 +32,75 @@ int get_proc_name(int pid, char *name, size_t size) {
     int fd;
     char buf[PATH_MAX];
     snprintf(buf, sizeof(buf), "/proc/%d/cmdline", pid);
-    if ((fd = open(buf, O_RDONLY)) == -1)
+    if ((fd = open(buf, O_RDONLY | O_CLOEXEC)) == -1)
         return 1;
-    fdgets(name, size, fd);
+    ssize_t read_bytes = fdgets(name, size, fd);
     close(fd);
-    return 0;
+    return read_bytes <= 0 ? 1 : 0;
 }
 
 int is_num(const char *s) {
+    if (s == nullptr)
+        return 0;
     size_t len = strlen(s);
-    for (size_t i = 0; i < len; ++i)
+    if (len == 0)
+        return 0;
+    for (size_t i = 0; i < len; ++i) {
         if (s[i] < '0' || s[i] > '9')
             return 0;
+    }
     return 1;
+}
+
+bool parse_proc_status_uid(const char *status_buf, size_t len, uid_t *out_uid) {
+    if (status_buf == nullptr || out_uid == nullptr || len == 0)
+        return false;
+
+    const char *cursor = status_buf;
+    const char *end = status_buf + len;
+
+    while (cursor < end) {
+        const char *line_end = static_cast<const char *>(memchr(cursor, '\n', static_cast<size_t>(end - cursor)));
+        if (line_end == nullptr)
+            line_end = end;
+
+        size_t line_len = static_cast<size_t>(line_end - cursor);
+        if (line_len >= 4 && memcmp(cursor, "Uid:", 4) == 0) {
+            const char *p = cursor + 4;
+            while (p < line_end && (*p == ' ' || *p == '\t'))
+                ++p;
+            if (p < line_end && *p >= '0' && *p <= '9') {
+                unsigned long val = 0;
+                while (p < line_end && *p >= '0' && *p <= '9') {
+                    val = val * 10 + static_cast<unsigned long>(*p - '0');
+                    ++p;
+                }
+                *out_uid = static_cast<uid_t>(val);
+                return true;
+            }
+        }
+        cursor = (line_end < end) ? (line_end + 1) : end;
+    }
+    return false;
+}
+
+int get_proc_uid(int pid, uid_t *out_uid) {
+    if (out_uid == nullptr)
+        return -1;
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd == -1)
+        return -1;
+
+    char buf[4096];
+    ssize_t n = fdgets(buf, sizeof(buf), fd);
+    close(fd);
+    if (n <= 0)
+        return -1;
+
+    return parse_proc_status_uid(buf, static_cast<size_t>(n), out_uid) ? 0 : -1;
 }
 
 int copyfileat(int src_path_fd, const char *src_path, int dst_path_fd, const char *dst_path) {
@@ -51,13 +111,15 @@ int copyfileat(int src_path_fd, const char *src_path, int dst_path_fd, const cha
     size_t count;
     ssize_t result;
 
-    if ((src_fd = openat(src_path_fd, src_path, O_RDONLY)) == -1)
+    if ((src_fd = openat(src_path_fd, src_path, O_RDONLY | O_CLOEXEC)) == -1)
         return -1;
 
-    if (fstat(src_fd, &stat_buf) == -1)
+    if (fstat(src_fd, &stat_buf) == -1) {
+        close(src_fd);
         return -1;
+    }
 
-    dst_fd = openat(dst_path_fd, dst_path, O_WRONLY | O_CREAT | O_TRUNC, stat_buf.st_mode);
+    dst_fd = openat(dst_path_fd, dst_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, stat_buf.st_mode);
     if (dst_fd == -1) {
         close(src_fd);
         return -1;
@@ -65,6 +127,11 @@ int copyfileat(int src_path_fd, const char *src_path, int dst_path_fd, const cha
 
     size_remaining = stat_buf.st_size;
     for (;;) {
+        if (size_remaining <= 0) {
+            close(src_fd);
+            close(dst_fd);
+            return 0;
+        }
         if (size_remaining > 0x7ffff000)
             count = 0x7ffff000;
         else
@@ -77,13 +144,13 @@ int copyfileat(int src_path_fd, const char *src_path, int dst_path_fd, const cha
             unlink(dst_path);
             return -1;
         }
-
-        size_remaining -= result;
-        if (size_remaining == 0) {
+        if (result == 0) {
             close(src_fd);
             close(dst_fd);
             return 0;
         }
+
+        size_remaining -= result;
     }
 }
 
@@ -109,7 +176,7 @@ int switch_mnt_ns(int pid) {
     snprintf(mnt, sizeof(mnt), "/proc/%d/ns/mnt", pid);
     if (access(mnt, R_OK) == -1) return -1;
 
-    int fd = open(mnt, O_RDONLY);
+    int fd = open(mnt, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
 
     int res = setns(fd, 0);
@@ -145,9 +212,6 @@ char *trim(char *str) {
     len = strlen(str);
     endp = str + len;
 
-    /* Move the front and back pointers to address the first non-whitespace
-     * characters from each end.
-     */
     while (isspace((unsigned char) *frontp)) { ++frontp; }
     if (endp != frontp) {
         while (isspace((unsigned char) *(--endp)) && endp != frontp) {}
@@ -158,10 +222,6 @@ char *trim(char *str) {
     else if (frontp != str && endp == frontp)
         *str = '\0';
 
-    /* Shift the string so that it starts at str so that if it's dynamically
-     * allocated, we can still free it on the returned pointer.  Note the reuse
-     * of endp to mean the front of the string buffer now.
-     */
     endp = str;
     if (frontp != str) {
         while (*frontp) { *endp++ = *frontp++; }
@@ -169,4 +229,59 @@ char *trim(char *str) {
     }
 
     return str;
+}
+
+bool write_exact_retry(int fd, const void *buf, size_t len) {
+    const auto *ptr = static_cast<const uint8_t *>(buf);
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t written = write(fd, ptr, remaining);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (written == 0)
+            return false;
+        ptr += written;
+        remaining -= static_cast<size_t>(written);
+    }
+    return true;
+}
+
+bool read_exact_retry(int fd, void *buf, size_t len) {
+    auto *ptr = static_cast<uint8_t *>(buf);
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = read(fd, ptr, remaining);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (n == 0)
+            return false;
+        ptr += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+void detach_stdio_to_dev_null() {
+    int fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (fd != -1) {
+        dup2(fd, STDIN_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        if (fd > 2)
+            close(fd);
+    }
+}
+
+uint64_t monotonic_now_ms() {
+    struct timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return static_cast<uint64_t>(ts.tv_sec) * 1000ULL +
+           static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL;
 }

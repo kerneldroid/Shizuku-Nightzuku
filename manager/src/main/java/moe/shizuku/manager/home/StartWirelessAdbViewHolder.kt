@@ -1,11 +1,8 @@
 package moe.shizuku.manager.home
 
-import android.Manifest.permission.WRITE_SECURE_SETTINGS
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.os.Build
-import android.provider.Settings
 import android.text.method.LinkMovementMethod
 import android.view.LayoutInflater
 import android.view.View
@@ -14,18 +11,16 @@ import android.widget.Toast
 import androidx.annotation.RequiresApi
 import androidx.core.view.isVisible
 import androidx.fragment.app.FragmentActivity
-import androidx.work.WorkManager
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import moe.shizuku.manager.Helps
-import moe.shizuku.manager.ShizukuSettings
 import moe.shizuku.manager.R
+import moe.shizuku.manager.ShizukuSettings
 import moe.shizuku.manager.adb.AdbPairingTutorialActivity
+import moe.shizuku.manager.adb.AdbSettings
 import moe.shizuku.manager.adb.AdbStarter
 import moe.shizuku.manager.databinding.HomeItemContainerBinding
 import moe.shizuku.manager.databinding.HomeStartWirelessAdbBinding
-import moe.shizuku.manager.home.showAccessibilityDialog
 import moe.shizuku.manager.ktx.toHtml
 import moe.shizuku.manager.receiver.NotifCancelReceiver
 import moe.shizuku.manager.starter.StarterActivity
@@ -41,7 +36,7 @@ class StartWirelessAdbViewHolder(binding: HomeStartWirelessAdbBinding, root: Vie
     BaseViewHolder<Any?>(root) {
 
     companion object {
-        fun creator (scope: CoroutineScope): Creator<Any> {
+        fun creator(scope: CoroutineScope): Creator<Any> {
             return Creator { inflater: LayoutInflater, parent: ViewGroup? ->
                 val outer = HomeItemContainerBinding.inflate(inflater, parent, false)
                 val inner = HomeStartWirelessAdbBinding.inflate(inflater, outer.root, true)
@@ -49,7 +44,7 @@ class StartWirelessAdbViewHolder(binding: HomeStartWirelessAdbBinding, root: Vie
             }
         }
 
-        fun start (context: Context, scope: CoroutineScope) {
+        fun start(context: Context, scope: CoroutineScope) {
             if (ShizukuStateMachine.get() == ShizukuStateMachine.State.STARTING) {
                 Toast.makeText(context, context.getString(R.string.toast_shizuku_already_starting), Toast.LENGTH_SHORT).show()
                 return
@@ -58,13 +53,9 @@ class StartWirelessAdbViewHolder(binding: HomeStartWirelessAdbBinding, root: Vie
             context.sendBroadcast(Intent(context, NotifCancelReceiver::class.java))
 
             val cr = context.contentResolver
-            if (context.checkSelfPermission(WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED) {
-                Settings.Global.putInt(cr, Settings.Global.ADB_ENABLED, 1)
-                Settings.Global.putLong(cr, "adb_allowed_connection_time", 0L)
-            }
-        
-            val adbEnabled = Settings.Global.getInt(cr, Settings.Global.ADB_ENABLED, 0)
-            if (adbEnabled == 0) {
+            AdbSettings.enableAdbBaseSettings(context)
+
+            if (!AdbSettings.isAdbEnabled(cr) && Build.VERSION.SDK_INT < 37) {
                 WadbEnableUsbDebuggingDialogFragment().show(context.asActivity<FragmentActivity>().supportFragmentManager)
                 return
             }
@@ -126,9 +117,6 @@ class StartWirelessAdbViewHolder(binding: HomeStartWirelessAdbBinding, root: Vie
         if (EnvironmentUtils.isTelevision()) {
             context.showAccessibilityDialog()
         } else if ((context.display?.displayId ?: -1) > 0 || ShizukuSettings.getLegacyPairing()) {
-            // Running in a multi-display environment (e.g., Windows Subsystem for Android),
-            // pairing dialog can be displayed simultaneously with Shizuku.
-            // Input from notification is harder to use under this situation.
             AdbPairDialogFragment().show(context.asActivity<FragmentActivity>().supportFragmentManager)
         } else {
             context.startActivity(Intent(context, AdbPairingTutorialActivity::class.java))

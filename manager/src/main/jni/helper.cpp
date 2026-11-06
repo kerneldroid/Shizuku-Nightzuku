@@ -13,9 +13,11 @@
 #include "logging.h"
 
 static jint setcontext(JNIEnv *env, jobject thiz, jstring jName) {
-    const char *name = env->GetStringUTFChars(jName, nullptr);
+    if (jName == nullptr || !se::setcon)
+        return -1;
 
-    if (!se::setcon)
+    const char *name = env->GetStringUTFChars(jName, nullptr);
+    if (name == nullptr)
         return -1;
 
     int res = se::setcon(name);

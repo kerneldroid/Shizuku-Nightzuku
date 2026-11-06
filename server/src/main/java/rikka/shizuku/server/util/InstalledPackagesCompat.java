@@ -2,6 +2,8 @@ package rikka.shizuku.server.util;
 
 import android.content.pm.PackageInfo;
 import android.os.Build;
+import android.os.IBinder;
+import android.os.ServiceManager;
 import android.util.Log;
 
 import java.lang.reflect.InvocationTargetException;
@@ -66,11 +68,20 @@ public final class InstalledPackagesCompat {
     }
 
     private static Object getPackageManager() throws ReflectiveOperationException {
-        Class<?> servicesClass = Class.forName("rikka.hidden.compat.Services");
-        var field = servicesClass.getDeclaredField("packageManager");
-        field.setAccessible(true);
-        Object service = field.get(null);
-        return service.getClass().getMethod("get").invoke(service);
+        try {
+            Class<?> servicesClass = Class.forName("rikka.hidden.compat.Services");
+            var field = servicesClass.getDeclaredField("packageManager");
+            field.setAccessible(true);
+            Object service = field.get(null);
+            Object pm = service.getClass().getMethod("get").invoke(service);
+            if (pm != null) {
+                return pm;
+            }
+        } catch (Throwable ignored) {
+        }
+        IBinder binder = ServiceManager.getService("package");
+        Class<?> stubClass = Class.forName("android.content.pm.IPackageManager$Stub");
+        return stubClass.getDeclaredMethod("asInterface", IBinder.class).invoke(null, binder);
     }
 
     private static Object getContextPackageManager() throws ReflectiveOperationException {

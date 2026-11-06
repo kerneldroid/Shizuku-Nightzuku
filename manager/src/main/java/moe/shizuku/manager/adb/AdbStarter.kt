@@ -1,9 +1,7 @@
 package moe.shizuku.manager.adb
 
-import android.Manifest.permission.WRITE_SECURE_SETTINGS
-import android.content.pm.PackageManager
 import android.content.Context
-import android.provider.Settings
+import android.os.Build
 import android.widget.Toast
 import java.io.EOFException
 import java.net.SocketException
@@ -14,9 +12,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import moe.shizuku.manager.R
 import moe.shizuku.manager.ShizukuSettings
-import moe.shizuku.manager.adb.AdbClient
-import moe.shizuku.manager.adb.AdbKey
-import moe.shizuku.manager.adb.PreferenceAdbKeyStore
 import moe.shizuku.manager.starter.Starter
 import moe.shizuku.manager.utils.EnvironmentUtils
 import moe.shizuku.manager.utils.ShizukuStateMachine
@@ -30,7 +25,7 @@ object AdbStarter {
         try {
             ShizukuStateMachine.set(ShizukuStateMachine.State.STARTING)
             log?.invoke("Starting with wireless adb...\n")
-        
+
             withContext(Dispatchers.IO) {
                 val key = runCatching { AdbKey(PreferenceAdbKeyStore(ShizukuSettings.getPreferences()), "shizuku") }
                     .getOrElse {
@@ -56,7 +51,7 @@ object AdbStarter {
                         }.onFailure { if (it !is EOFException && it !is SocketException) throw it } // Expected when ADB restarts in TCP mode
                     }
                 }
-        
+
                 log?.invoke("Connecting on port $activePort...")
 
                 AdbClient("127.0.0.1", activePort, key).use { client ->
@@ -66,21 +61,18 @@ object AdbStarter {
                 }
             }
         } finally {
-            if (context.checkSelfPermission(WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED)
-                Settings.Global.putInt(context.contentResolver, "adb_wifi_enabled", 0)
+            AdbSettings.setWifiAdbEnabled(context, false)
         }
     }
 
     suspend fun stopTcp(context: Context, port: Int) {
         runCatching {
             val cr = context.contentResolver
-            if (context.checkSelfPermission(WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED) {
-                Settings.Global.putInt(cr, Settings.Global.ADB_ENABLED, 1)
-                Settings.Global.putLong(cr, "adb_allowed_connection_time", 0L)
+            AdbSettings.enableAdbBaseSettings(context)
+
+            if (!AdbSettings.isAdbEnabled(cr) && Build.VERSION.SDK_INT < 37) {
+                throw IllegalStateException("ADB is not enabled")
             }
-        
-            val adbEnabled = Settings.Global.getInt(cr, Settings.Global.ADB_ENABLED, 0)
-            if (adbEnabled == 0) throw IllegalStateException("ADB is not enabled")
 
             ShizukuStateMachine.set(ShizukuStateMachine.State.STOPPING)
             val key = AdbKey(PreferenceAdbKeyStore(ShizukuSettings.getPreferences()), "shizuku")

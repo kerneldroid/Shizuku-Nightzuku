@@ -11,37 +11,64 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
-import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import moe.shizuku.manager.R
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import moe.shizuku.manager.MainActivity
+import moe.shizuku.manager.R
 import moe.shizuku.manager.ShizukuSettings
+import moe.shizuku.manager.nightdog.NightDogClient
 import moe.shizuku.manager.receiver.ShizukuReceiverStarter
 import moe.shizuku.manager.utils.SettingsPage
 import moe.shizuku.manager.utils.ShizukuStateMachine
-import java.util.concurrent.atomic.AtomicBoolean
 
 class WatchdogService : Service() {
 
-    private val stateListener: (ShizukuStateMachine.State) -> Unit = {
-        if (it == ShizukuStateMachine.State.CRASHED) {
-            showCrashNotification()
-            ShizukuReceiverStarter.start(applicationContext)
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var crashRecoveryJob: Job? = null
+    private var telemetryPollJob: Job? = null
+
+    private val stateListener: (ShizukuStateMachine.State) -> Unit = { state ->
+        when (state) {
+            ShizukuStateMachine.State.RUNNING -> {
+                crashRecoveryJob?.cancel()
+                crashRecoveryJob = null
+                serviceScope.launch {
+                    NightDogClient.syncWithServer()
+                    NightDogClient.refreshWatchdogStatus()
+                }
+            }
+            ShizukuStateMachine.State.CRASHED -> {
+                scheduleCrashRecovery()
+            }
+            else -> {}
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         isRunning.set(true)
+        NightDogClient.init(applicationContext)
+        NightDogClient.setEnabled(true)
         ShizukuStateMachine.addListener(stateListener)
+        startTelemetryPolling()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "ACTION_STOP_SERVICE") {
+            NightDogClient.setEnabled(false)
             stopSelf()
             return START_NOT_STICKY
         }
+        NightDogClient.setEnabled(true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID_WATCHDOG,
@@ -58,13 +85,54 @@ class WatchdogService : Service() {
     }
 
     override fun onDestroy() {
+        crashRecoveryJob?.cancel()
+        crashRecoveryJob = null
+        telemetryPollJob?.cancel()
+        telemetryPollJob = null
+        serviceScope.cancel()
         ShizukuStateMachine.removeListener(stateListener)
         isRunning.set(false)
+        NightDogClient.setEnabled(false)
         ShizukuSettings.setWatchdog(applicationContext, false)
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * Coordinates with the native C++ NightDog supervisor (`libshizuku.so`):
+     * when `shizuku_server` crashes or is terminated by `NightDog` for recovery, the native
+     * C++ supervisor respawns `shizuku_server` after 5 seconds. Waiting briefly avoids
+     * unnecessarily triggering Wireless ADB discovery when the native supervisor already
+     * recovered the server process.
+     */
+    private fun scheduleCrashRecovery() {
+        crashRecoveryJob?.cancel()
+        crashRecoveryJob = serviceScope.launch {
+            delay(NATIVE_SUPERVISOR_GRACE_MS)
+            if (ShizukuStateMachine.update() == ShizukuStateMachine.State.RUNNING) {
+                Log.i(TAG, "Server was recovered by native C++ NightDog supervisor")
+                NightDogClient.syncWithServer()
+                NightDogClient.refreshWatchdogStatus()
+                return@launch
+            }
+            showCrashNotification()
+            ShizukuReceiverStarter.start(applicationContext)
+        }
+    }
+
+    private fun startTelemetryPolling() {
+        telemetryPollJob?.cancel()
+        telemetryPollJob = serviceScope.launch {
+            while (isActive) {
+                if (ShizukuStateMachine.isRunning()) {
+                    NightDogClient.syncWithServer()
+                    NightDogClient.refreshWatchdogStatus()
+                }
+                delay(TELEMETRY_POLL_INTERVAL_MS)
+            }
+        }
+    }
 
     private fun buildNotification(): Notification {
         val channelId = "shizuku_watchdog"
@@ -80,9 +148,9 @@ class WatchdogService : Service() {
 
         val launchIntent = Intent(this, MainActivity::class.java).apply {
             addFlags(
-                Intent.FLAG_ACTIVITY_NEW_TASK or 
-                Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                Intent.FLAG_ACTIVITY_SINGLE_TOP
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
             )
         }
         val launchPendingIntent = PendingIntent.getActivity(
@@ -124,10 +192,14 @@ class WatchdogService : Service() {
         val learnMoreIntent = Intent(Intent.ACTION_VIEW).apply {
             setData(Uri.parse("https://github.com/thedjchi/Shizuku/wiki#shizuku-keeps-stopping-randomly"))
         }
-        val learnMorePendingIntent = PendingIntent.getActivity(this, 0, learnMoreIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val learnMorePendingIntent = PendingIntent.getActivity(
+            this, 0, learnMoreIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
 
         val disableIntent = SettingsPage.Notifications.NotificationChannel.buildIntent(applicationContext)
-        val disablePendingIntent = PendingIntent.getActivity(this, 0, disableIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val disablePendingIntent = PendingIntent.getActivity(
+            this, 0, disableIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle(getString(R.string.watchdog_shizuku_crashed_title))
@@ -145,6 +217,8 @@ class WatchdogService : Service() {
         private const val TAG = "ShizukuWatchdog"
         private const val NOTIFICATION_ID_WATCHDOG = 1001
         private const val NOTIFICATION_ID_CRASH = 1002
+        private const val NATIVE_SUPERVISOR_GRACE_MS = 6_500L
+        private const val TELEMETRY_POLL_INTERVAL_MS = 60_000L
         const val CRASH_CHANNEL_ID = "crash_reports"
 
         private val isRunning = AtomicBoolean(false)
@@ -152,14 +226,16 @@ class WatchdogService : Service() {
         @JvmStatic
         fun start(context: Context) {
             try {
+                NightDogClient.setEnabled(true)
                 context.startForegroundService(Intent(context, WatchdogService::class.java))
             } catch (e: Exception) {
-                Log.e("ShizukuApplication", "Failed to start WatchdogService: ${e.message}" )
+                Log.e("ShizukuApplication", "Failed to start WatchdogService: ${e.message}")
             }
         }
 
         @JvmStatic
         fun stop(context: Context) {
+            NightDogClient.setEnabled(false)
             context.stopService(Intent(context, WatchdogService::class.java))
         }
 

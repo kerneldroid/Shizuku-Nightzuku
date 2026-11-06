@@ -29,14 +29,11 @@ import android.os.Looper;
 import android.os.Parcel;
 import android.os.RemoteException;
 import android.os.ServiceManager;
-import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import java.io.File;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -46,49 +43,53 @@ import kotlin.collections.ArraysKt;
 import moe.shizuku.api.BinderContainer;
 import moe.shizuku.common.util.BuildUtils;
 import moe.shizuku.common.util.OsUtils;
+import moe.shizuku.server.BuildConfig;
 import moe.shizuku.server.IShizukuApplication;
 import rikka.hidden.compat.ActivityManagerApis;
 import rikka.hidden.compat.DeviceIdleControllerApis;
 import rikka.hidden.compat.PackageManagerApis;
-import rikka.shizuku.server.util.Android17Compat;
-import rikka.hidden.compat.UserManagerApis;
 import rikka.parcelablelist.ParcelableListSlice;
 import rikka.rish.RishConfig;
 import rikka.shizuku.ShizukuApiConstants;
+import rikka.shizuku.nightdog.NightDog;
 import rikka.shizuku.server.api.IContentProviderUtils;
+import rikka.shizuku.server.util.Android17Compat;
 import rikka.shizuku.server.util.HandlerUtil;
 import rikka.shizuku.server.util.InstalledPackagesCompat;
 import rikka.shizuku.server.util.UserHandleCompat;
+import rikka.shizuku.server.util.UsersCompat;
 
 public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuClientManager, ShizukuConfigManager> {
 
     public static final String MANAGER_APPLICATION_ID;
+    private static final long HEARTBEAT_INTERVAL_MS = 5_000L;
+    private static final long RECONCILE_INTERVAL_MS = 5_000L;
 
     static {
-        String packageName = null;
+        String packageName = BuildConfig.MANAGER_APPLICATION_ID;
         try {
             String apk = System.getenv("CLASSPATH");
+            if (apk != null && !apk.isEmpty()) {
+                int lastSlash = apk.lastIndexOf(File.separatorChar);
+                if (lastSlash > 0) {
+                    String parentDir = apk.substring(0, lastSlash);
+                    int secondLastSlash = parentDir.lastIndexOf(File.separatorChar);
+                    String dirName = parentDir.substring(secondLastSlash + 1);
 
-            int lastSlash = apk.lastIndexOf(File.separatorChar);
-            String parentDir = apk.substring(0, lastSlash);
-
-            int secondLastSlash = parentDir.lastIndexOf(File.separatorChar);
-            String dirName = parentDir.substring(secondLastSlash + 1);
-
-            int dash = dirName.indexOf('-');
-            if (dash > 0) {
-                packageName = dirName.substring(0, dash);
-            } else {
-                packageName = dirName;
+                    int dash = dirName.indexOf('-');
+                    if (dash > 0) {
+                        packageName = dirName.substring(0, dash);
+                    } else if (!dirName.isEmpty()) {
+                        packageName = dirName;
+                    }
+                }
             }
-
             LOGGER.i("Manager package name is " + packageName);
         } catch (Throwable tr) {
             LOGGER.w("Couldn't get manager package name from CLASSPATH", tr);
         }
         MANAGER_APPLICATION_ID = packageName;
     }
-
 
     public static void main(String[] args) {
         DdmHandleAppName.setAppName("shizuku_server", 0);
@@ -116,10 +117,11 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
 
     @SuppressWarnings({"FieldCanBeLocal"})
     private final Handler mainHandler = new Handler(Looper.myLooper());
-    //private final Context systemContext = HiddenApiBridge.getSystemContext();
     private final ShizukuClientManager clientManager;
     private final ShizukuConfigManager configManager;
     private final int managerAppId;
+    private Runnable heartbeatRunnable;
+    private Runnable packageReconcileRunnable;
 
     public ShizukuService() {
         super();
@@ -139,7 +141,7 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
         }
 
         assert ai != null;
-        managerAppId = ai.uid;
+        managerAppId = UserHandleCompat.getAppId(ai.uid);
 
         configManager = getConfigManager();
         clientManager = getClientManager();
@@ -153,10 +155,103 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
 
         BinderSender.register(this);
 
-        mainHandler.post(() -> {
+        if (configManager.getNightDogEnabled()) {
+            applyNightDogState(true);
+        }
+
+        startPackageReconciler();
+
+        BinderSender.dispatchTask(() -> {
             sendBinderToClient();
             sendBinderToManager();
         });
+    }
+
+    /**
+     * Periodically verifies that the manager app remains installed in user 0.
+     * Essential when running as ADB (u:r:shell:s0) where SELinux blocks inotify on /data/app.
+     */
+    private void startPackageReconciler() {
+        packageReconcileRunnable = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (ServiceManager.getService("package") != null && getManagerApplicationInfo() == null) {
+                        LOGGER.w("manager app is uninstalled in user 0 (reconciler), exiting...");
+                        System.exit(ServerConstants.MANAGER_APP_NOT_FOUND);
+                        return;
+                    }
+                } catch (Throwable t) {
+                    LOGGER.w(t, "Package reconciliation check failed");
+                }
+                mainHandler.postDelayed(this, RECONCILE_INTERVAL_MS);
+            }
+        };
+        mainHandler.postDelayed(packageReconcileRunnable, RECONCILE_INTERVAL_MS);
+    }
+
+    private void applyNightDogState(boolean enabled) {
+        if (heartbeatRunnable != null) {
+            mainHandler.removeCallbacks(heartbeatRunnable);
+            heartbeatRunnable = null;
+        }
+
+        if (enabled) {
+            if (!NightDog.isStarted()) {
+                LOGGER.i("Starting NightDog watchdog...");
+                NightDog.start(
+                        NightDog.DEFAULT_TIMEOUT_MS,
+                        NightDog.DEFAULT_POLL_INTERVAL_MS,
+                        new NightDog.Listener() {
+                            @Override
+                            public void onServiceRecovered(@NonNull String name) {
+                                LOGGER.i("NightDog: system service '%s' recovered, refreshing bindings", name);
+                                Android17Compat.invalidate(name);
+                                if (Context.ACTIVITY_SERVICE.equals(name)) {
+                                    UsersCompat.invalidateActivityManager();
+                                }
+                                mainHandler.post(() -> {
+                                    if (Context.ACTIVITY_SERVICE.equals(name)) {
+                                        BinderSender.register(ShizukuService.this);
+                                    }
+                                    if (Context.ACTIVITY_SERVICE.equals(name)
+                                            || "package".equals(name)
+                                            || Context.USER_SERVICE.equals(name)) {
+                                        BinderSender.dispatchTask(() -> {
+                                            sendBinderToManager();
+                                            sendBinderToClient();
+                                        });
+                                    }
+                                });
+                            }
+
+                            @Override
+                            public void onFatalFault(@NonNull String reason) {
+                                LOGGER.e("NightDog detected fatal fault (%s), terminating server for recovery", reason);
+                            }
+                        }
+                );
+                LOGGER.i("NightDog watchdog started");
+            }
+
+            heartbeatRunnable = new Runnable() {
+                @Override
+                public void run() {
+                    if (!NightDog.isStarted()) {
+                        return;
+                    }
+                    NightDog.beat();
+                    mainHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS);
+                }
+            };
+            NightDog.beat();
+            mainHandler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS);
+        } else {
+            if (NightDog.isStarted()) {
+                NightDog.stop();
+                LOGGER.i("NightDog watchdog stopped");
+            }
+        }
     }
 
     @Override
@@ -205,12 +300,21 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
     public void exit() {
         enforceManagerPermission("exit");
         LOGGER.i("exit");
+        if (heartbeatRunnable != null) {
+            mainHandler.removeCallbacks(heartbeatRunnable);
+            heartbeatRunnable = null;
+        }
+        if (packageReconcileRunnable != null) {
+            mainHandler.removeCallbacks(packageReconcileRunnable);
+            packageReconcileRunnable = null;
+        }
+        NightDog.stop();
         System.exit(0);
     }
 
     @Override
     public void attachUserService(IBinder binder, Bundle options) {
-        enforceManagerPermission("func");
+        enforceManagerPermission("attachUserService");
 
         super.attachUserService(binder, options);
     }
@@ -234,8 +338,8 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
 
         List<String> packages = PackageManagerApis.getPackagesForUidNoThrow(callingUid);
         if (!packages.contains(requestPackageName)) {
-            LOGGER.w("Request package " + requestPackageName + "does not belong to uid " + callingUid);
-            throw new SecurityException("Request package " + requestPackageName + "does not belong to uid " + callingUid);
+            LOGGER.w("Request package " + requestPackageName + " does not belong to uid " + callingUid);
+            throw new SecurityException("Request package " + requestPackageName + " does not belong to uid " + callingUid);
         }
 
         isManager = MANAGER_APPLICATION_ID.equals(requestPackageName);
@@ -248,16 +352,14 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
                 LOGGER.w("Add client failed");
                 return;
             }
+        } else {
+            clientRecord = clientManager.findClient(callingUid, callingPid);
         }
 
         LOGGER.d("attachApplication: %s %d %d", requestPackageName, callingUid, callingPid);
 
         int replyServerVersion = ShizukuApiConstants.SERVER_VERSION;
         if (apiVersion == -1) {
-            // ShizukuBinderWrapper has adapted API v13 in dev.rikka.shizuku:api 12.2.0, however
-            // attachApplication in 12.2.0 is still old, so that server treat the client as pre 13.
-            // This finally cause transactRemote fails.
-            // So we can pass 12 here to pretend we are v12 server.
             replyServerVersion = 12;
         }
 
@@ -292,12 +394,18 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
         }
 
         PackageInfo pi = Android17Compat.getPackageInfo(MANAGER_APPLICATION_ID, 0, userId);
-        UserInfo userInfo = UserManagerApis.getUserInfo(userId);
-        boolean isWorkProfileUser = BuildUtils.atLeast30() ?
+        UserInfo userInfo = UsersCompat.getUserInfo(userId);
+        boolean isWorkProfileUser = userInfo != null && (BuildUtils.atLeast30() ?
                 "android.os.usertype.profile.MANAGED".equals(userInfo.userType) :
-                (userInfo.flags & UserInfo.FLAG_MANAGED_PROFILE) != 0;
+                (userInfo.flags & UserInfo.FLAG_MANAGED_PROFILE) != 0);
         if (pi == null && !isWorkProfileUser) {
             LOGGER.w("Manager not found in non work profile user %d. Revoke permission", userId);
+            clientRecord.dispatchRequestPermissionResult(requestCode, false);
+            return;
+        }
+
+        if (userId != 0 && !isWorkProfileUser && !UsersCompat.isUserForeground(userId)) {
+            LOGGER.w("Cannot display permission confirmation for background secondary user %d", userId);
             clientRecord.dispatchRequestPermissionResult(requestCode, false);
             return;
         }
@@ -347,7 +455,7 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
             configManager.update(requestUid, packages, ConfigManager.MASK_PERMISSION, allowed ? ConfigManager.FLAG_ALLOWED : ConfigManager.FLAG_DENIED);
         }
 
-        if (!onetime && allowed) {
+        if (!onetime) {
             int userId = UserHandleCompat.getUserId(requestUid);
 
             for (String packageName : PackageManagerApis.getPackagesForUidNoThrow(requestUid)) {
@@ -356,7 +464,6 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
                     continue;
                 }
 
-                int deviceId = 0;//Context.DEVICE_ID_DEFAULT
                 if (allowed) {
                     Android17Compat.grantRuntimePermission(packageName, PERMISSION, userId);
                 } else {
@@ -366,7 +473,7 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
         }
     }
 
-    private int  getFlagsForUidInternal(int uid, int mask, boolean allowRuntimePermission) {
+    private int getFlagsForUidInternal(int uid, int mask, boolean allowRuntimePermission) {
         ShizukuConfig.PackageEntry entry = configManager.find(uid);
         if (entry != null) {
             return entry.flags & mask;
@@ -381,7 +488,8 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
                 }
 
                 try {
-                    if (Android17Compat.checkPermission(PERMISSION, uid) == PackageManager.PERMISSION_GRANTED) {
+                    if (Android17Compat.checkPermission(PERMISSION, packageName, userId) == PackageManager.PERMISSION_GRANTED
+                            || Android17Compat.checkPermission(PERMISSION, uid) == PackageManager.PERMISSION_GRANTED) {
                         return ConfigManager.FLAG_ALLOWED;
                     }
                 } catch (Throwable e) {
@@ -395,7 +503,7 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
     @Override
     public int getFlagsForUid(int uid, int mask) {
         if (UserHandleCompat.getAppId(Binder.getCallingUid()) != managerAppId) {
-            LOGGER.w("updateFlagsForUid is allowed to be called only from the manager");
+            LOGGER.w("getFlagsForUid is allowed to be called only from the manager");
             return 0;
         }
         return getFlagsForUidInternal(uid, mask, true);
@@ -412,12 +520,15 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
 
         if ((mask & ConfigManager.MASK_PERMISSION) != 0) {
             boolean allowed = (value & ConfigManager.FLAG_ALLOWED) != 0;
-            boolean denied = (value & ConfigManager.FLAG_DENIED) != 0;
 
             List<ClientRecord> records = clientManager.findClients(uid);
             for (ClientRecord record : records) {
                 if (allowed) {
+                    boolean wasDenied = !record.allowed;
                     record.allowed = true;
+                    if (wasDenied) {
+                        ActivityManagerApis.forceStopPackageNoThrow(record.packageName, UserHandleCompat.getUserId(record.uid));
+                    }
                 } else {
                     record.allowed = false;
                     ActivityManagerApis.forceStopPackageNoThrow(record.packageName, UserHandleCompat.getUserId(record.uid));
@@ -431,14 +542,11 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
                     continue;
                 }
 
-                int deviceId = 0;//Context.DEVICE_ID_DEFAULT
                 if (allowed) {
                     Android17Compat.grantRuntimePermission(packageName, PERMISSION, userId);
                 } else {
                     Android17Compat.revokeRuntimePermission(packageName, PERMISSION, userId);
                 }
-
-                // TODO kill user service using
             }
         }
 
@@ -446,7 +554,6 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
     }
 
     private void onPermissionRevoked(String packageName) {
-        // TODO add runtime permission listener
         getUserServiceManager().removeUserServicesForPackage(packageName);
     }
 
@@ -454,7 +561,7 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
         List<PackageInfo> list = new ArrayList<>();
         List<Integer> users = new ArrayList<>();
         if (userId == -1) {
-            users.addAll(UserManagerApis.getUserIdsNoThrow());
+            users.addAll(UsersCompat.getUserIdsNoThrow());
         } else {
             users.add(userId);
         }
@@ -489,20 +596,100 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
 
     @Override
     public boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
-        //LOGGER.d("transact: code=%d, calling uid=%d", code, Binder.getCallingUid());
-        if (code == ServerConstants.BINDER_TRANSACTION_getApplications) {
+        if (code == ShizukuApiConstants.BINDER_TRANSACTION_transact) {
+            data.enforceInterface(ShizukuApiConstants.BINDER_DESCRIPTOR);
+            enforceCallingPermission("transactRemote");
+            int startPos = data.dataPosition();
+            IBinder targetBinder = data.readStrongBinder();
+            if (targetBinder == null) {
+                throw new IllegalArgumentException("Target binder cannot be null");
+            }
+            if (targetBinder == this) {
+                throw new SecurityException("Self-referential binder forwarding to server endpoint is forbidden");
+            }
+            String descriptor = null;
+            try {
+                descriptor = targetBinder.getInterfaceDescriptor();
+            } catch (Throwable ignored) {
+            }
+            if (ShizukuApiConstants.BINDER_DESCRIPTOR.equals(descriptor)) {
+                throw new SecurityException("Forwarding transactions to privileged server interface is forbidden");
+            }
+            data.setDataPosition(startPos);
+            transactRemote(data, reply, flags);
+            return true;
+        } else if (code == ServerConstants.BINDER_TRANSACTION_getApplications) {
+            if (!checkCallerManagerPermission("getApplications", Binder.getCallingUid(), Binder.getCallingPid())
+                    && checkCallingPermission() != PackageManager.PERMISSION_GRANTED) {
+                if (reply != null) {
+                    reply.writeException(new SecurityException("Permission denied"));
+                }
+                return true;
+            }
             data.enforceInterface(ShizukuApiConstants.BINDER_DESCRIPTOR);
             int userId = data.readInt();
             ParcelableListSlice<PackageInfo> result = getApplications(userId);
-            reply.writeNoException();
-            result.writeToParcel(reply, android.os.Parcelable.PARCELABLE_WRITE_RETURN_VALUE);
+            if (reply != null) {
+                reply.writeNoException();
+                result.writeToParcel(reply, android.os.Parcelable.PARCELABLE_WRITE_RETURN_VALUE);
+            }
+            return true;
+        } else if (code == ServerConstants.BINDER_TRANSACTION_setNightDogEnabled) {
+            if (!checkCallerManagerPermission("setNightDogEnabled", Binder.getCallingUid(), Binder.getCallingPid())) {
+                if (reply != null) {
+                    reply.writeException(new SecurityException("Permission denied"));
+                }
+                return true;
+            }
+            data.enforceInterface(ShizukuApiConstants.BINDER_DESCRIPTOR);
+            boolean enabled = data.readInt() != 0;
+            LOGGER.i("setNightDogEnabled: %s", Boolean.toString(enabled));
+            configManager.setNightDogEnabled(enabled);
+            applyNightDogState(enabled);
+            if (reply != null) {
+                reply.writeNoException();
+            }
+            return true;
+        } else if (code == ServerConstants.BINDER_TRANSACTION_getNightDogEnabled) {
+            if (!checkCallerManagerPermission("getNightDogEnabled", Binder.getCallingUid(), Binder.getCallingPid())) {
+                if (reply != null) {
+                    reply.writeException(new SecurityException("Permission denied"));
+                }
+                return true;
+            }
+            data.enforceInterface(ShizukuApiConstants.BINDER_DESCRIPTOR);
+            if (reply != null) {
+                reply.writeNoException();
+                reply.writeInt(configManager.getNightDogEnabled() ? 1 : 0);
+            }
+            return true;
+        } else if (code == ServerConstants.BINDER_TRANSACTION_getNightDogStatus) {
+            if (!checkCallerManagerPermission("getNightDogStatus", Binder.getCallingUid(), Binder.getCallingPid())) {
+                if (reply != null) {
+                    reply.writeException(new SecurityException("Permission denied"));
+                }
+                return true;
+            }
+            data.enforceInterface(ShizukuApiConstants.BINDER_DESCRIPTOR);
+            Bundle statusBundle = new Bundle();
+            statusBundle.putBoolean("enabled", configManager.getNightDogEnabled());
+            statusBundle.putBoolean("started", NightDog.isStarted());
+            statusBundle.putInt("boundServicesCount", NightDog.getBoundServiceCount());
+            statusBundle.putInt("totalRebinds", NightDog.getTotalRebinds());
+            statusBundle.putLong("beatCount", NightDog.getBeatCount());
+            statusBundle.putLong("uptimeMs", NightDog.getUptimeMs());
+            statusBundle.putStringArrayList("boundServices", new ArrayList<>(NightDog.getBoundServiceNames()));
+            if (reply != null) {
+                reply.writeNoException();
+                reply.writeBundle(statusBundle);
+            }
             return true;
         }
         return super.onTransact(code, data, reply, flags);
     }
 
     void sendBinderToClient() {
-        for (int userId : UserManagerApis.getUserIdsNoThrow()) {
+        for (int userId : UsersCompat.getUserIdsNoThrow()) {
             sendBinderToClient(this, userId);
         }
     }
@@ -510,19 +697,19 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
     private static void sendBinderToClient(Binder binder, int userId) {
         try {
             Stream<PackageInfo> packages =
-                InstalledPackagesCompat.getInstalledPackagesNoThrow(
-                    PackageManager.GET_PERMISSIONS, userId
-                )
-                .stream()
-                .filter(pi -> pi != null && pi.requestedPermissions != null)
-                .filter(pi -> ArraysKt.contains(pi.requestedPermissions, PERMISSION));
+                    InstalledPackagesCompat.getInstalledPackagesNoThrow(
+                            PackageManager.GET_PERMISSIONS, userId
+                    )
+                    .stream()
+                    .filter(pi -> pi != null && pi.requestedPermissions != null)
+                    .filter(pi -> ArraysKt.contains(pi.requestedPermissions, PERMISSION));
 
             LOGGER.i("sending binders");
             packages
-                .parallel()
-                .forEach(pi -> {
-                    sendBinderToUserApp(binder, pi.packageName, userId);
-                });
+                    .parallel()
+                    .forEach(pi -> {
+                        sendBinderToUserApp(binder, pi.packageName, userId);
+                    });
             LOGGER.i("sent binders");
         } catch (Throwable tr) {
             LOGGER.e("exception when call getInstalledPackages", tr);
@@ -534,7 +721,7 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
     }
 
     private static void sendBinderToManager(Binder binder) {
-        for (int userId : UserManagerApis.getUserIdsNoThrow()) {
+        for (int userId : UsersCompat.getUserIdsNoThrow()) {
             sendBinderToManager(binder, userId);
         }
     }
@@ -542,8 +729,6 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
     static void sendBinderToManager(Binder binder, int userId) {
         boolean success = sendBinderToUserApp(binder, MANAGER_APPLICATION_ID, userId);
         if (!success) {
-            // For unknown reason, sometimes this could happens
-            // Kill Shizuku app and try again could work
             try {
                 LOGGER.e("kill %s in user %d and try again", MANAGER_APPLICATION_ID, userId);
                 ActivityManagerApis.forceStopPackageNoThrow(MANAGER_APPLICATION_ID, userId);
@@ -572,17 +757,6 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
 
         String name = packageName + ".shizuku";
         IContentProvider provider = null;
-
-        /*
-         When we pass IBinder through binder (and really crossed process), the receive side (here is system_server process)
-         will always get a new instance of android.os.BinderProxy.
-
-         In the implementation of getContentProviderExternal and removeContentProviderExternal, received
-         IBinder is used as the key of a HashMap. But hashCode() is not implemented by BinderProxy, so
-         removeContentProviderExternal will never work.
-
-         Luckily, we can pass null. When token is token, count will be used.
-         */
         IBinder token = null;
 
         try {

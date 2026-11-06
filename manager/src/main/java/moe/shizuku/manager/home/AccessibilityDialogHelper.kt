@@ -12,7 +12,6 @@ import android.text.style.TypefaceSpan
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import moe.shizuku.manager.R
 import moe.shizuku.manager.adb.AdbPairingAccessibilityService
-import moe.shizuku.manager.utils.SettingsHelper
 import moe.shizuku.manager.utils.SettingsPage
 
 fun Context.showAccessibilityDialog() {
@@ -76,11 +75,12 @@ private fun Context.showNavigateDialog() {
 }
 
 private fun Context.getEnabledAccessibilityServices(): List<String>? {
-    val enabledServices =
+    val enabledServices = runCatching {
         Settings.Secure.getString(
             contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
         )
+    }.getOrNull()
     return enabledServices?.split(":")
 }
 
@@ -101,11 +101,13 @@ private fun Context.enableAccessibilityService(): Boolean {
             enabledServices.joinToString(":") + ":$accessibilityServiceName"
         }
 
-    Settings.Secure.putString(
-        contentResolver,
-        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-        newServices,
-    )
+    runCatching {
+        Settings.Secure.putString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            newServices,
+        )
+    }
 
     return isAccessibilityEnabled()
 }

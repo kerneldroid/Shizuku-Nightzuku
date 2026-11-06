@@ -1,8 +1,10 @@
 #include <sys/system_properties.h>
 #include <cstring>
+#include <cstdlib>
 #include <climits>
 #include <fcntl.h>
 #include <unistd.h>
+#include "android.h"
 
 namespace android {
 

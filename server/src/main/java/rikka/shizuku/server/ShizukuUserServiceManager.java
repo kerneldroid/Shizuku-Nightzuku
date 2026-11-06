@@ -4,15 +4,13 @@ import android.content.pm.PackageInfo;
 import android.util.ArrayMap;
 
 import java.io.File;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
 import moe.shizuku.starter.ServiceStarter;
 import rikka.shizuku.server.util.Android17Compat;
-import rikka.hidden.compat.UserManagerApis;
-import rikka.shizuku.server.util.UserHandleCompat;
+import rikka.shizuku.server.util.UsersCompat;
 
 public class ShizukuUserServiceManager extends UserServiceManager {
 
@@ -49,7 +47,7 @@ public class ShizukuUserServiceManager extends UserServiceManager {
             public void onApkChanged() {
                 String newSourceDir = null;
 
-                for (int userId : UserManagerApis.getUserIdsNoThrow()) {
+                for (int userId : UsersCompat.getUserIdsNoThrow()) {
                     PackageInfo pi = Android17Compat.getPackageInfo(packageName, 0, userId);
                     if (pi != null && pi.applicationInfo != null && pi.applicationInfo.sourceDir != null) {
                         newSourceDir = pi.applicationInfo.sourceDir;
@@ -75,10 +73,9 @@ public class ShizukuUserServiceManager extends UserServiceManager {
     @Override
     public void onUserServiceRecordRemoved(UserServiceRecord record) {
         super.onUserServiceRecordRemoved(record);
-        ApkChangedListener listener = apkChangedListeners.get(record);
+        ApkChangedListener listener = apkChangedListeners.remove(record);
         if (listener != null) {
             ApkChangedObservers.stop(listener);
-            apkChangedListeners.remove(record);
         }
     }
 }

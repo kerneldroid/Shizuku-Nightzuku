@@ -1,26 +1,23 @@
 package moe.shizuku.manager.adb
 
 import android.accessibilityservice.AccessibilityService
-import android.view.accessibility.AccessibilityEvent
 import android.content.Intent
 import android.os.Handler
 import android.os.Looper
+import android.view.accessibility.AccessibilityEvent
 import android.widget.Toast
-import android.provider.Settings
-import android.content.ActivityNotFoundException
+import java.net.ConnectException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import moe.shizuku.manager.R
 import moe.shizuku.manager.MainActivity
+import moe.shizuku.manager.R
 import moe.shizuku.manager.ShizukuSettings
-import moe.shizuku.manager.adb.PreferenceAdbKeyStore
-import moe.shizuku.manager.adb.AdbKey
-import moe.shizuku.manager.adb.AdbPairingClient
 import moe.shizuku.manager.home.HomeActivity
 import moe.shizuku.manager.utils.EnvironmentUtils
-import java.net.ConnectException
 
 class AdbPairingAccessibilityService : AccessibilityService() {
 
@@ -28,10 +25,11 @@ class AdbPairingAccessibilityService : AccessibilityService() {
     var password: String? = null
 
     private val handler = Handler(Looper.getMainLooper())
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        
+
         if (!(EnvironmentUtils.isTelevision() && EnvironmentUtils.isTlsSupported())) {
             Toast.makeText(this, getString(R.string.toast_accessibility_tv_only), Toast.LENGTH_SHORT).show()
             disableSelf()
@@ -40,9 +38,9 @@ class AdbPairingAccessibilityService : AccessibilityService() {
 
         val intent = Intent(this, MainActivity::class.java).apply {
             addFlags(
-                Intent.FLAG_ACTIVITY_NEW_TASK or 
-                Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                Intent.FLAG_ACTIVITY_SINGLE_TOP
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
             )
             putExtra(HomeActivity.EXTRA_SHOW_PAIRING_DIALOG, true)
         }
@@ -78,18 +76,24 @@ class AdbPairingAccessibilityService : AccessibilityService() {
             val password = password!!
 
             var toastMsg = getString(R.string.notification_adb_pairing_failed_title)
-            GlobalScope.launch(Dispatchers.IO) {
+            serviceScope.launch {
                 val host = "127.0.0.1"
 
                 val key = try {
                     AdbKey(PreferenceAdbKeyStore(ShizukuSettings.getPreferences()), "shizuku")
                 } catch (e: Throwable) {
                     toastMsg = getString(R.string.adb_error_key_store)
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@AdbPairingAccessibilityService, toastMsg, Toast.LENGTH_LONG).show()
+                    }
+                    disableSelf()
                     return@launch
                 }
 
-                AdbPairingClient(host, port, password, key).runCatching {
-                    start()
+                runCatching {
+                    AdbPairingClient(host, port, password, key).use { client ->
+                        client.start()
+                    }
                 }.onFailure {
                     when (it) {
                         is ConnectException -> toastMsg = getString(R.string.cannot_connect_port)
@@ -99,7 +103,7 @@ class AdbPairingAccessibilityService : AccessibilityService() {
                 }.onSuccess {
                     if (it) {
                         toastMsg = "${getString(R.string.notification_adb_pairing_succeed_title)}. ${getString(R.string.notification_adb_pairing_succeed_text)}"
-                   
+
                         val intent = Intent(this@AdbPairingAccessibilityService, MainActivity::class.java).apply {
                             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                         }
@@ -118,7 +122,14 @@ class AdbPairingAccessibilityService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         handler.removeCallbacksAndMessages(null)
+        serviceScope.cancel()
         return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        serviceScope.cancel()
+        super.onDestroy()
     }
 
 }

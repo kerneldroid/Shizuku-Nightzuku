@@ -3,11 +3,8 @@ package moe.shizuku.manager.home
 import android.annotation.SuppressLint
 import android.app.Application
 import android.app.Dialog
-import android.content.ActivityNotFoundException
-import android.content.Intent
 import android.os.Build.VERSION_CODES
 import android.os.Bundle
-import android.provider.Settings
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.widget.Toast
@@ -21,17 +18,16 @@ import androidx.fragment.app.activityViewModels
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.viewModelScope
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import java.net.ConnectException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
 import moe.shizuku.manager.R
 import moe.shizuku.manager.ShizukuSettings
 import moe.shizuku.manager.adb.*
 import moe.shizuku.manager.databinding.AdbPairDialogBinding
 import moe.shizuku.manager.utils.SettingsHelper
-import moe.shizuku.manager.utils.SettingsPage
-import java.net.ConnectException
 
 @RequiresApi(VERSION_CODES.R)
 class AdbPairDialogFragment : DialogFragment() {
@@ -168,7 +164,7 @@ class ViewModel(application: Application) : AndroidViewModel(application) {
     private var resolvedHost: String = "127.0.0.1"
 
     private val adbMdns: AdbMdns = AdbMdns(appContext, AdbMdns.TLS_PAIRING) {
-        if (it.second > 0) resolvedHost = it.first
+        if (it.second > 0 && it.first.isNotEmpty()) resolvedHost = it.first
         _port.postValue(it.second)
     }
 
@@ -177,7 +173,7 @@ class ViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun run(port: Int, password: String) {
-        GlobalScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO) {
             val host = resolvedHost
 
             val key = try {
@@ -188,8 +184,10 @@ class ViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            AdbPairingClient(host, port, password, key).runCatching {
-                start()
+            runCatching {
+                AdbPairingClient(host, port, password, key).use { client ->
+                    client.start()
+                }
             }.onFailure {
                 _result.postValue(it)
                 it.printStackTrace()

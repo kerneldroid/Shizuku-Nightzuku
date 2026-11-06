@@ -10,4 +10,7 @@ public class ServerConstants {
     public static final String REQUEST_PERMISSION_ACTION = BuildConfig.MANAGER_APPLICATION_ID + ".intent.action.REQUEST_PERMISSION";
 
     public static final int BINDER_TRANSACTION_getApplications = 10001;
+    public static final int BINDER_TRANSACTION_setNightDogEnabled = 10002;
+    public static final int BINDER_TRANSACTION_getNightDogEnabled = 10003;
+    public static final int BINDER_TRANSACTION_getNightDogStatus = 10005;
 }
