@@ -76,9 +76,9 @@ jobs:
       - name: Create signing.properties
         if: ${{ inputs.debug != true && env.KEYSTORE != '' }}
         run: |
-          echo KEYSTORE_PASSWORD='${{ secrets.KEYSTORE_PASSWORD }}' > signing.properties
-          echo KEYSTORE_ALIAS='${{ secrets.KEYSTORE_ALIAS }}' >> signing.properties
-          echo KEYSTORE_ALIAS_PASSWORD='${{ secrets.KEYSTORE_ALIAS_PASSWORD }}' >> signing.properties
+          echo KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }} > signing.properties
+          echo KEYSTORE_ALIAS=${{ secrets.KEYSTORE_ALIAS }} >> signing.properties
+          echo KEYSTORE_ALIAS_PASSWORD=${{ secrets.KEYSTORE_ALIAS_PASSWORD }} >> signing.properties
           echo KEYSTORE_FILE=../key.jks >> signing.properties
           printf '%s' "$KEYSTORE" | base64 --decode > key.jks
 
@@ -172,4 +172,4 @@ jobs:
           fi
 
           NOTES="Signed release APK built from \`${GITHUB_SHA}\` by GitHub Actions.\n\nSHA-256: \`${SHA256}\`"
-          gh release create "$TAG" "files/${ARTIFACT_NAME}" --generate-notes --notes "$NOTES" $FLAGS
+          gh release create "$TAG" "files/${ARTIFACT_NAME}" --notes "$NOTES" $FLAGS
