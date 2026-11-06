@@ -77,7 +77,7 @@ jobs:
         if: ${{ inputs.debug != true && env.KEYSTORE != '' }}
         run: |
           echo KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }} > signing.properties
-          echo KEYSTORE_ALIAS=${{ secrets.KEYSTORE_ALIAS }} >> signing.properties
+          echo KEYSTORE_ALIAS=nightzuku >> signing.properties
           echo KEYSTORE_ALIAS_PASSWORD=${{ secrets.KEYSTORE_ALIAS_PASSWORD }} >> signing.properties
           echo KEYSTORE_FILE=../key.jks >> signing.properties
           printf '%s' "$KEYSTORE" | base64 --decode > key.jks
@@ -146,30 +146,34 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v7
         with:
-          name: ${{ needs.build.outputs.artifactName }}
+          pattern: Shizuku-Nightzuku-*.apk
           path: files
+          merge-multiple: true
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.build.outputs.versionName }}
-          ARTIFACT_NAME: ${{ needs.build.outputs.artifactName }}
           SHA256: ${{ needs.build.outputs.sha256 }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
+          if [ -z "${VERSION}" ]; then
+            VERSION=$(basename "$(ls files/*.apk | head -n 1)" .apk | sed -E 's/^Shizuku-Nightzuku-//')
+          fi
           if [ "${{ github.event_name }}" = "push" ]; then
             TAG="${{ github.ref_name }}"
           else
             TAG="v${VERSION}"
           fi
 
-          FLAGS="--title Shizuku-Nightzuku-${VERSION}"
-          if [ "$PRERELEASE" = "true" ]; then
-            FLAGS="$FLAGS --prerelease"
-          else
-            FLAGS="$FLAGS --latest"
-          fi
+          APK=$(ls files/*.apk | head -n 1)
+          NOTES=$(printf 'Signed release APK built from `%s` by GitHub Actions.\n\nSHA-256: `%s`' "${GITHUB_SHA}" "${SHA256}")
 
-          NOTES="Signed release APK built from \`${GITHUB_SHA}\` by GitHub Actions.\n\nSHA-256: \`${SHA256}\`"
-          gh release create "$TAG" "files/${ARTIFACT_NAME}" --notes "$NOTES" $FLAGS
+          ARGS=(--title "Shizuku Nightzuku ${VERSION}" --notes "${NOTES}")
+          if [ "$PRERELEASE" = "true" ]; then
+            ARGS+=(--prerelease)
+          else
+            ARGS+=(--latest)
+          fi
+          gh release create "$TAG" "$APK" "${ARGS[@]}"

@@ -6,6 +6,8 @@ An Android app that allows other apps to use system-level APIs that require ADB/
 
 **Shizuku Nightzuku** is a maintenance fork of [`thedjchi/Shizuku`](https://github.com/thedjchi/Shizuku), maintained by [**kerneldroid**](https://github.com/kerneldroid). It backports the native C++ supervisor, **NightDog** watchdog, **Android 17** hidden-API compatibility, and **Android 17 QPR3** wireless ADB fixes from [**Nightzuku**](https://github.com/kerneldroid/Nightzuku) while preserving `thedjchi`'s original UI and feature set.
 
+> **Maintenance status:** this fork is provided as-is and will not be actively maintained. For a maintained fork with ongoing updates, use [**kerneldroid/Nightzuku**](https://github.com/kerneldroid/Nightzuku).
+
 [![Latest Release](https://img.shields.io/github/v/release/kerneldroid/Shizuku-Nightzuku?style=for-the-badge&color=3060bf&labelColor=204080&label=Latest%20Release)](https://github.com/kerneldroid/Shizuku-Nightzuku/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/kerneldroid/Shizuku-Nightzuku/total?style=for-the-badge&color=bf7830&labelColor=805020&label=Downloads)](https://github.com/kerneldroid/Shizuku-Nightzuku/releases)
 
